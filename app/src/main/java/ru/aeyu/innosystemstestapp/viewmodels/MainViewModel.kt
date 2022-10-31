@@ -6,6 +6,7 @@ import android.content.res.AssetFileDescriptor
 import android.hardware.display.DisplayManager
 import android.media.MediaPlayer
 import android.os.Build
+import android.os.Environment
 import android.util.DisplayMetrics
 import android.util.Size
 import android.view.SurfaceHolder
@@ -24,6 +25,9 @@ import ru.aeyu.innosystemstestapp.json.ParseJson
 import ru.aeyu.innosystemstestapp.json.ReadJsonFromFileUseCase
 import ru.aeyu.innosystemstestapp.model.VideoFileItem
 import ru.aeyu.innosystemstestapp.model.VideoFiles
+import ru.aeyu.innosystemstestapp.providers.Providers
+import ru.aeyu.innosystemstestapp.repositories.SaveFileInfoRepo
+import ru.aeyu.innosystemstestapp.utils.ExportFileToLocalMemory
 import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
@@ -44,6 +48,8 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
 
     private var mediaPlayer: MediaPlayer? = null
     private var isMPPrepared = false
+
+    private val saveFileInfoRepo: SaveFileInfoRepo = Providers(myApp.baseContext).getSaveRepo()
 
     companion object {
         const val PATH_VIDEOS = "Videos"
@@ -103,11 +109,53 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         _assetFd.emit(currentAssetFileDescriptor)
     }
 
+    /**
+     * Запустить следующий по порядку ролик
+     */
+    private fun playNext() {
+        viewModelScope.launch(Dispatchers.IO) {
+            printLog("playNext()")
+            setViewModelState(MainStates.Loading)
+            emitFileDescriptor(playList.nextFile())
+        }
+    }
+
+    /**
+     * Запустить текущий прерванный ролик
+     */
+    private fun playCurrent() {
+        printLog("resumeCurrentVideo()")
+        viewModelScope.launch(Dispatchers.IO) {
+            printLog("playCurrent()")
+            setViewModelState(MainStates.Loading)
+            emitFileDescriptor(playList.currentFile())
+        }
+    }
+
+    /**
+     * Прослушиваем новые дескрипторы файлов для проигрывания
+     */
+    private fun collectFileDescriptors() {
+        viewModelScope.launch(Dispatchers.Main) {
+            assetFd.collect { afd ->
+                setupMediaPlayer(afd)
+            }
+        }
+    }
+
     private fun prepareData() {
         printLog("prepareData")
+        if (currentSurfaceHolder == null)
+            return
         mediaPlayer = MediaPlayer()
         updateMediaPlayerSurface()
-        play()
+        printLog("prepareData - play()")
+        //Продолжаем видео, на котором прервались
+        if (currentFilePosition != 0) {
+            playCurrent()
+        } else {
+            playNext()
+        }
     }
 
     private fun updateMediaPlayerSurface() {
@@ -120,44 +168,11 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         }
     }
 
-    private fun playNext() {
-        viewModelScope.launch(Dispatchers.IO) {
-            printLog("playNext()")
-            setViewModelState(MainStates.Loading)
-            emitFileDescriptor(playList.nextFile())
-        }
-    }
-
-    private fun play() {
-        if (currentSurfaceHolder == null)
-            return
-        printLog("play()")
-        //Продолжаем видео, на котором прервались
-        if (currentFilePosition != 0) {
-            playCurrent()
-        } else {
-            playNext()
-        }
-    }
-
-    private fun playCurrent() {
-        printLog("resumeCurrentVideo()")
-        viewModelScope.launch(Dispatchers.IO) {
-            printLog("playCurrent()")
-            setViewModelState(MainStates.Loading)
-            emitFileDescriptor(playList.currentFile())
-        }
-    }
-
-    private fun collectFileDescriptors() {
-        viewModelScope.launch(Dispatchers.Main) {
-            assetFd.collect { afd ->
-                initMediaPlayer(afd)
-            }
-        }
-    }
-
-    private fun initMediaPlayer(fileDescriptor: AssetFileDescriptor) {
+    /**
+     * Подготавливаем медиаплеер к запуску очередного файла
+     * @param fileDescriptor
+     */
+    private fun setupMediaPlayer(fileDescriptor: AssetFileDescriptor) {
 
         try {
             mediaPlayer?.setDataSource(
@@ -180,7 +195,7 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         } catch (e: IllegalStateException) {
             setErrState("prepareAsync.IllegalStateException: ${e.localizedMessage}")
             return
-        }catch (e: IOException) {
+        } catch (e: IOException) {
             setErrState("prepareAsync.IOException: ${e.localizedMessage}")
             return
         }
@@ -190,7 +205,9 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         mediaPlayer?.setOnVideoSizeChangedListener(mediaPlayerSizeChangeListener)
     }
 
-
+    /**
+     * Очищаем переменные при уничтожении surfaceView
+     */
     private fun surfaceDestroyed() {
         currentSurfaceHolder = null
         currentAssetFileDescriptor.close()
@@ -198,9 +215,13 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
 
     override fun onCleared() {
         super.onCleared()
+        // осовобождаем память
         releaseMediaPlayer()
     }
 
+    /**
+     * Функция очищает память от медиа плеера
+     */
     private fun releaseMediaPlayer() {
         printLog("releasePlayer()")
         mediaPlayer?.stop()
@@ -209,8 +230,11 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         mediaPlayer = null
     }
 
+    /**
+     * переводим медиаплеер в состояние Idle для дальнейшей загрузки нового файла
+     */
     private fun resetMediaPlayer() {
-        if(isMPPrepared) {
+        if (isMPPrepared) {
             printLog("resetMediaPlayer()")
             mediaPlayer?.reset()
             isMPPrepared = false
@@ -222,19 +246,27 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
         isMPPrepared = true
         setViewModelState(MainStates.Idle)
         try {
-            if(currentFilePosition != 0)
+            // Если проигрывание было прервано, то возобновляем, примерно,
+            // с той позиции откуда закончили
+            if (currentFilePosition != 0)
                 it.seekTo(currentFilePosition)
             it.start()
         } catch (e: IllegalStateException) {
             setErrState("OnPreparedListener.IllegalStateException: ${e.localizedMessage}")
+            return@OnPreparedListener
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            saveFileInfoRepo.addFileInfo(playList.currentFile())
         }
     }
 
     private val mediaPlayerCompleteListener = MediaPlayer.OnCompletionListener {
         printLog("mediaPlayerCompleteListener: it.isPlaying: ${it.isPlaying}")
-        if(it.isPlaying)
+        // по завершению проигрывания текущего файла выполняем ряд действий по очистке памяти
+        // и некоторых переменных
+        if (it.isPlaying)
             it.stop()
-        if(mediaPlayer?.isPlaying == true)
+        if (mediaPlayer?.isPlaying == true)
             mediaPlayer?.stop()
         currentAssetFileDescriptor.close()
         currentFilePosition = 0
@@ -244,38 +276,40 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
 
     private val mediaPlayerErrorListener = MediaPlayer.OnErrorListener { _, _, _ ->
         printLog("MediaPlayer.OnErrorListener")
+        // в случае ошибки возвращаем false, чтобы перейти в состояние OnCompletionListener
         false
     }
 
-    private val mediaPlayerSizeChangeListener = MediaPlayer.OnVideoSizeChangedListener { player, width, height ->
-        player.videoWidth
-        if(width > 0 && height > 0) {
-            // соотношение ширины и высоты видео
-            val aspectRatio = height.toFloat() / width.toFloat()
+    private val mediaPlayerSizeChangeListener =
+        MediaPlayer.OnVideoSizeChangedListener { player, width, height ->
+            // Если размеры видео изменились то подгоняем видео под размеры экрана
+            if (width > 0 && height > 0) {
+                // соотношение ширины и высоты видео
+                val aspectRatio = height.toFloat() / width.toFloat()
 
-            // текущие размеры экрана
-            val screenDimensions = getDisplaySize()
-            printLog("Size: $screenDimensions")
+                // текущие размеры экрана
+                val screenDimensions = getDisplaySize()
+                printLog("Size: $screenDimensions")
 
-            // в зависимости от ориентации экрана вычисляем размеры поверхности для отображения
-            // видео
-            val params = if(screenDimensions.height >= screenDimensions.width) {
-                // портретная ориентация
-                val surfWidth = screenDimensions.width
-                val surfHeight = (surfWidth * aspectRatio).toInt()
-                ConstraintLayout.LayoutParams(surfWidth, surfHeight)
-            } else {
-                //альбомная ориентация
-                val surfHeight = screenDimensions.height
-                val surfWidth = (surfHeight / aspectRatio).toInt()
-                ConstraintLayout.LayoutParams(surfWidth, surfHeight)
-            }
+                // в зависимости от ориентации экрана вычисляем размеры поверхности для отображения
+                // видео
+                val params = if (screenDimensions.height >= screenDimensions.width) {
+                    // портретная ориентация
+                    val surfWidth = screenDimensions.width
+                    val surfHeight = (surfWidth * aspectRatio).toInt()
+                    ConstraintLayout.LayoutParams(surfWidth, surfHeight)
+                } else {
+                    //альбомная ориентация
+                    val surfHeight = screenDimensions.height
+                    val surfWidth = (surfHeight / aspectRatio).toInt()
+                    ConstraintLayout.LayoutParams(surfWidth, surfHeight)
+                }
 
-            viewModelScope.launch {
-                _layoutParamsFlow.emit(params)
+                viewModelScope.launch {
+                    _layoutParamsFlow.emit(params)
+                }
             }
         }
-    }
 
     /**
      * Данная функция вычисляет размеры экрана
@@ -312,7 +346,7 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
 //                displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)
             if (displayManager.displays.isEmpty()) {
                 Size(0, 0)
-            }else {
+            } else {
                 val display = displayManager.displays[0]
                 val metrics = DisplayMetrics()
                 display.getMetrics(metrics)
@@ -326,8 +360,8 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
      * т.к. в этом состоянии уничтожится surfaceView и holder, то очищаем медиа плеер
      */
     private fun pauseView() {
-        if(isMPPrepared) {
-            printLog("pause()")
+        if (isMPPrepared) {
+            printLog("pauseView()")
             currentFilePosition = mediaPlayer?.currentPosition ?: 0
             releaseMediaPlayer()
         }
@@ -345,6 +379,7 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
             }
             MainEvents.OnViewStart -> {
                 printLog("OnViewStart")
+                prepareData()
             }
             MainEvents.OnViewStop -> {
                 printLog("OnViewStop")
@@ -364,4 +399,20 @@ class MainViewModel(mApp: Application) : BaseViewModel<MainEvents, MainStates>(m
     private fun setErrState(errMessage: String) {
         setViewModelState(MainStates.Error(errMessage))
     }
+
+    suspend fun exportFile(exportFileName: String): Flow<String> = flow {
+//            val myDB: MainDataBase = MainDataBase.getInstance(myApp.baseContext)
+        val toFileString = myApp.baseContext.getExternalFilesDir(
+            Environment.DIRECTORY_DOWNLOADS
+        ).toString() + File.separator.toString() + exportFileName
+//            myDB.close()
+
+        val fromFile = myApp.baseContext.getDatabasePath(exportFileName)
+
+        val result = ExportFileToLocalMemory().export(toFileString, fromFile)
+        result.collect {
+            emit(it)
+        }
+    }
+
 }

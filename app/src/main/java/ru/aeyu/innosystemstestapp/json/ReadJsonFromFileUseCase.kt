@@ -9,19 +9,10 @@ class ReadJsonFromFileUseCase {
 
     fun read(inputStream: InputStream): String {
         return try {
-             inputStream.bufferedReader()
+            inputStream.bufferedReader()
                 .use {reader ->
                     reader.readText()
                 }
-//            val fis = FileInputStream(File(fullJsonFileName))
-//            val reader = BufferedReader(InputStreamReader(fis))
-//            while (true) {
-//                val line: String = reader.readLine() ?: break
-//                strBuilder.append(line).append("\n")
-//            }
-//            reader.close()
-//            fis.close()
-//            strBuilder
         } catch (npe: NullPointerException) {
             npe.printStackTrace()
             ""
